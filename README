@@ -1,0 +1,173 @@
+DESCRIPTION
+-----------
+Implementation of bkpfs file system.
+The bkpfs file system generates backups based on policies configured during mount time.
+Ioctls are used to operate on the backup files, which are hidden from the user on bkpfs file system.
+
+
+
+
+
+DESIGN
+------
+When the backup?
+Policy -The system generates backups whenever a regular file is modified by 10 bytes or more.
+	The file also has to be -
+	- In O_WRONLY|O_RDWR|O_TRUNC modes and file.
+	- Not have "bkpfs" as first 5 letters.
+	- Must be a regular file.
+Why? - 	The polcy is easy to implement as we set a counter during file open to 0, during write this is incremented.
+	The counter is checked during close.
+	Can be easily configurable.
+	However this comes with certain restrictions, please refer to RESTRICTIONS section of this document
+
+
+What to backup?
+Policy -The current working file during closing time is copiedi/cloned as backup. 
+	Essentially following git's principle.
+	- A remote copy (our last backup)
+	- Keeping a local copy (where user will modify things).
+	A special meta file is used to keep track of backups (names of files).
+	The order of the backups is used to keep track of oldest and the newest
+Why? - 	There's only a handful of places where backup can be taken, bkpfs_open, bkpfs_write, bkpfs_file_release (close).
+	Problems with other policies - 
+	   bkpfs_open - 
+		We do not know yet if we need to backup since nothing is written to the file yet. 
+		The user could simply open and close the file and not write anything.
+	   bkpfs_write - 
+		The user could do essentially write gibberish and rewrite over and over again.
+		It's inefficient to mimic whatever the user writes.
+		It's more efficient to simply wait for the user to make changes to the file.
+	Conclusion - 
+	   	Writing backup during closing time means that the user has decided to not make any further changes until next time.
+	   	It's also more efficient because we don't have to go on a wild goose chase (trying to follow whatever the user is 
+		writing and mimicing it), rather just wait for the goose to exhaust it's energy (until the user is done writing).
+	 
+
+Where to backup?
+Policy -Backups are saved in the same directory as the file we are trying to take backup of. 
+	A "bkpfs" extension is used for every file that is used by bkpfs file system.
+	A special "bkpfs.FILENAME.meta" file is used to keep track of all backups for "FILENAME".
+	The format of the backup file is - "bkpfs.FILENAME.XXX", where XXX is a unique identifier.
+	The backup files are saved only on lower file system.
+	However, this policy has some restrictions, please refer to RESTRICTIONS section.
+Why? - 	- To keep it persistent after umount and mount.
+	- The reason why we are saving it on lower filesystem is not deal with ref count on both upper and lower level.
+		Also it's redundant, to keep dentry on both upper and lower layers if we are only going to access the files using 
+		ioctls,and not bkpfs functions.
+	- The unique identifier is to make sure that no 2 files on the system have the same name. This solves the problem of saving
+	space to keep track of backup versions of the file.
+
+
+
+
+
+IMPLEMENTATION DETAILS
+----------------------
+Legends - 
+R (Regular File's)
+B (Backup File's)
+M (Meta File)
+D (Dentry)
+I (Inode)
+
+File creation on bkpfs
+(1) Scenario - 
+	User writes script to create file for the first time (R) (May be chooses to write). 
+Actions -
+	backup_helper() is called from bkpfs_file_release(). 
+		The file (R) we are trying to take back up must be a regular file. 
+		Must be in O_WRONLY|O_RDWR|O_TRUNC MODE.
+		Should not have "bkpfs" as the first 5 characters.
+	This regular file (R) resides on both bkpfs and lower file system. 
+	In backup_helper() a negative dentry(D) is created, along with a new inode (B), and contents of regular file (R) is copied.
+	The meta file (M) is updated using update_meta_file() with Backup File's name.
+
+
+
+Invalid file creation on bkpfs	
+(2) Scenario - 
+	User tries to do operations (cat,ls,create) on a "bkpfs" file (M/B).
+Actions - 
+	bkpfs_lookup() is called and checks the first 5 bytes of the string. If they match, returns ENOENT
+
+
+
+Listing all versions of a file
+(3) Scenario - 
+	User wants to list all backups of a given file (R).
+	Does bkpfs -l FILENAME (R)
+Actions - 
+	ioctl VIEW in bkpfs_unlocked_ioctl() is called
+	We get the meta file (M) name using this following method - "bkpfs." + FILENAME (R) + ".meta"
+	Which calls view_version(), which takes in meta file * (M).
+	Gets all the file names and puts them in a buffer which is then returned to the user space.
+
+
+
+Restoring a given version
+(4) Scenario - 
+	User wants to restore a version 
+	Does bkpfs -r 2 FILENAME (R)
+Actions - 
+	ioctl RESTORE in bkpfs_unlocked_ioctl() is called
+	We get the meta file (M) name using this following method - "bkpfs." + FILENAME (R) + ".meta"
+	Which calls restore_version(), which takes in meta file * (M) and the version number of backup file.
+	Creates a backup of the current contents of the file.
+	Writes contents from "bkfs.FILENAME.XXX" (B) to FILENAME (R)
+	Deletes any old version if it needs to (If we exceed the number of allowed version for the file system)
+	Updates meta file by appending name of the newly created backup	
+
+
+
+Viewing a given version
+(5) Scenario - 
+	User wants to view a version 
+	Does bkpfs -v 2 FILENAME (R)
+Actions - 
+	ioctl VIEW in bkpfs_unlocked_ioctl() is called
+	We get the meta file (M) name using this following method - "bkpfs." + FILENAME (R) + ".meta"
+	Which calls view_version(), which takes in meta file * (M) and the version number of backup file.
+	Reads contents from "bkfs.FILENAME.XXX" (B) to puts them in a buffer to be sent to the user.
+	This is configured to read upto 4096 bytes, as it's impractical for user to view anything more
+	than that. Instead the user can restore a file and view contents of the file.
+
+
+Deleting a given version
+Restoring a given version
+(6) Scenario - 
+	User wants to delete a version 
+	Does bkpfs -v 2 FILENAME (R)
+Actions - 
+	ioctl DELETE in bkpfs_unlocked_ioctl() is called
+	We get the meta file (M) name using this following method - "bkpfs." + FILENAME (R) + ".meta"
+	Which calls view_version(), which takes in meta file * (M) and the version number of backup file.
+	Checks if the file "bkfs.FILENAME.XXX" (B) is valid.
+	Checks if the name is on meta_file.
+	If both conditions are met then proceed with vfs_unlink() and update meta data file (M)
+	 
+
+Locations of Functionalities (For Grader Use)
+All ioctl calls [1] are interceptd in bkpfs_unlocked_ioctl() in file.c
+All readdir calls [2] are intercepted in bkfps_readdir() by intercepting the callback function
+All mount point functionalities are handled in main.c
+All ioctl call definitions and backup creation helper functions are in backup.c
+All helper functions are in helper.c
+
+
+EXTRA FUNCTIONALTIES
+--------------------
+Can DELETE any backup version
+./bkpctl -[ld:v:r:] FILE
+-d ARG: option to "delete" versions; ARG can be "newest", "oldest", or "all" or N (1 ... )
+
+
+RESTRICTIONS
+------------
+Users are not permitted to create file with "bkpfs" extension.
+
+
+REFERENCES
+----------
+[1] IOCTL - https://embetronicx.com/tutorials/linux/device-drivers/ioctl-tutorial-in-linux/
+[2] FATFS - Method signature was followed while omitting files from readdir (dir_context * ctx)

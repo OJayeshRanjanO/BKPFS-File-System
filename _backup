@@ -1,0 +1,192 @@
+#include "bkpfs.h"
+#include <linux/time.h>
+
+static int backup_file_counter = 0;
+void backup_helper(struct inode *inode, struct file *file){
+
+	struct path lower_path;//Needs to be released here
+	struct path lower_parent_path;
+	struct dentry * lower_dentry = NULL;//Need to release
+	struct dentry * lower_parent_dentry;
+	
+	char * backup_name;
+
+	char * meta_name;
+	struct path meta_path;
+	struct dentry * meta_dentry = NULL;
+	int meta_found;
+	UDBG;
+	backup_name = kzalloc(strlen("bkpfs.") + strlen(file->f_path.dentry->d_name.name) + 6,GFP_KERNEL);
+	snprintf(backup_name,strlen("bkpfs.") + strlen(file->f_path.dentry->d_name.name) + 6,
+		 "bkpfs.%s.%03d",file->f_path.dentry->d_name.name, backup_file_counter);
+
+	//Create dentry for lowerfs
+	bkpfs_get_lower_path(file->f_path.dentry, &lower_path);//put path
+	bkpfs_get_lower_path(file->f_path.dentry->d_parent, &lower_parent_path);//put path
+	lower_parent_dentry = lower_path.dentry->d_parent;
+	lower_dentry = create_negative_dentry(lower_parent_dentry,backup_name);//dput
+
+	printk("LOWER PARENT DENTRY %s LOWER DENTRY %s:",lower_dentry->d_parent->d_name.name,lower_dentry->d_name.name);
+
+	//Check meta file exists
+	meta_name = kzalloc(strlen("bkpfs.") + strlen(file->f_path.dentry->d_name.name) + strlen(".meta")+1,GFP_KERNEL);//free
+	snprintf(meta_name,strlen("bkpfs.") + strlen(file->f_path.dentry->d_name.name) + strlen(".meta")+1,
+		 "bkpfs.%s.meta",file->f_path.dentry->d_name.name);
+	meta_found = vfs_path_lookup(file->f_path.dentry->d_parent,lower_path.mnt,meta_name,0,&meta_path);//put path
+	if (meta_found!=0){//Create the meta file
+		meta_dentry = create_negative_dentry(lower_parent_dentry,meta_name);//dput
+		create_file(lower_parent_dentry->d_inode, lower_path.mnt ,meta_dentry,33188,0);	
+	}else{
+		meta_dentry = meta_path.dentry;
+	}
+	
+	if (!meta_dentry){
+		//goto out
+		return
+	}
+
+	
+	
+
+	printk("meta_found %d meta_name %s",meta_found, meta_name);
+	return;	
+
+	create_file(lower_parent_dentry->d_inode, lower_path.mnt ,lower_dentry,33188,0);
+	write_to_file(file,lower_parent_dentry->d_inode, lower_path.mnt ,lower_dentry);
+	backup_file_counter++;
+//out:
+	//fput(lower_file);
+	//printk("I am in");
+	//kfree(backup_name); //BROKEN FIX THIS!!!
+	if (meta_dentry){
+		dput(meta_dentry);
+	}
+	if (lower_dentry){
+		dput(lower_dentry);
+	}
+	printk("I am in");
+
+}
+int write_backup_file(struct file * file, struct inode *dir, struct vfsmount *mnt, struct dentry *dst_dentry)
+{
+	int err = 0;
+	
+	struct file * dst_file = NULL;
+	struct file * src_file = NULL;
+	struct path dst_path;
+	struct path src_path; //Derieved from file * file;
+	
+	mm_segment_t old_fs;
+	char * buffer = NULL;
+	size_t bytes_left = 0;
+	size_t bytes_read = 0;
+	UDBG;
+
+	printk("I am in");
+	/* Use vfs_path_lookup to check if the dentry exists or not */
+	err = vfs_path_lookup(dst_dentry->d_parent, mnt, dst_dentry->d_name.name , 0,&dst_path);
+	if (err){
+		printk("shit happened");
+	}
+	printk("Dentry: %s Parent: %s Root: %s",dst_path.dentry->d_name.name, 
+						dst_path.dentry->d_parent->d_name.name,
+						dst_path.mnt->mnt_root->d_name.name);
+	dst_file = dentry_open(&dst_path, O_WRONLY, current_cred());
+
+
+	bkpfs_get_lower_path(file->f_path.dentry, &src_path);
+	printk("Dentry: %s Parent: %s Root: %s",src_path.dentry->d_name.name, 
+						src_path.dentry->d_parent->d_name.name,
+						src_path.mnt->mnt_root->d_name.name);
+	src_file = dentry_open(&src_path,O_RDONLY, current_cred());
+	printk("I am in");
+	printk("src loft: %lld dst loft: %lld",src_file->f_pos,dst_file->f_pos);
+	printk("src_file bytes %lld",src_file->f_path.dentry->d_inode->i_size);
+	
+	//err = do_splice_direct( src_file, &src_file->f_pos,dst_file, &dst_file->f_pos, strlen("Hello World") , FMODE_WRITE);
+
+	buffer = kzalloc(PAGE_SIZE,GFP_KERNEL);
+	
+	old_fs = get_fs();
+	set_fs(KERNEL_DS);
+
+	bytes_left = src_file->f_path.dentry->d_inode->i_size;
+	while (bytes_left != 0){
+		bytes_read = bytes_left < PAGE_SIZE ? bytes_left : PAGE_SIZE;
+		vfs_read(src_file, buffer, bytes_read, &(src_file->f_pos) );
+		vfs_write(dst_file,buffer,bytes_read,&(dst_file->f_pos));
+		bytes_left -= bytes_read;
+	}	
+	
+	set_fs(old_fs);
+	printk("Buffer: %s",buffer);
+
+	if (err){
+		printk("ERR %d",err);
+		printk("shit happened");
+	}
+	printk("I am in");
+	if (dst_file)
+		fput(dst_file);
+	printk("I am in");
+	if (src_file)
+		fput(src_file);
+	printk("I am in");
+	if (buffer)
+		kfree(buffer);
+	printk("I am in");
+	path_put(&src_path);
+	printk("I am in");
+	path_put(&dst_path);
+	return err;
+}
+
+int create_file(struct inode *dir, struct vfsmount *mnt, struct dentry *lower_dentry,umode_t mode, bool want_excl)
+{
+	int err;
+	//struct dentry *lower_dentry;
+	struct dentry *lower_parent_dentry = NULL;
+        UDBG;
+
+	printk("create_lower_dentry: %s", lower_dentry->d_name.name);
+	lower_parent_dentry = lock_parent(lower_dentry);
+	printk("create_parent_dentry: %s", lower_parent_dentry->d_name.name);
+	err = vfs_create(d_inode(lower_parent_dentry), lower_dentry, mode, want_excl);
+	printk("Superblock: %s",dir->i_sb->s_root->d_name.name);
+	if (err)
+		goto out;
+out:
+	unlock_dir(lower_parent_dentry);
+	printk("create done");
+	return err;
+}
+
+
+
+
+struct dentry * create_negative_dentry (struct dentry * dir_dentry, char * name){
+	struct qstr this;
+	struct dentry *ret_dentry = NULL;
+        UDBG;
+	printk("dir_dentry %s, name %s",dir_dentry->d_name.name,name);
+
+	/* instatiate a new negative dentry */
+	this.name = name;
+	this.len = strlen(name);
+	this.hash = full_name_hash(dir_dentry, this.name, this.len);
+	ret_dentry = d_lookup(dir_dentry, &this);
+	if (ret_dentry)
+		printk(":Dentry exists");
+
+	ret_dentry = d_alloc(dir_dentry, &this);
+	if (!ret_dentry) {
+		printk(":Cannot d_alloc");
+	}
+	d_add(ret_dentry, NULL); /* instantiate and hash */
+	
+	return ret_dentry;
+
+}
+
+
+
